@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 import marqo
 import warnings
 from tenacity import retry, wait_random_exponential, stop_after_attempt
@@ -34,7 +34,7 @@ if not MARQO_UPSERT_BATCH_SIZE:
 
 # if model not provided then use default
 if not MARQO_INFERENCE_MODEL:
-    MARQO_INFERENCE_MODEL = "ViT-L/14"
+    MARQO_INFERENCE_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
 class MarqoDataStore(DataStore):
     def __init__(self):
@@ -107,7 +107,7 @@ class MarqoDataStore(DataStore):
         """
 
         results = self.client.bulk_search(
-            [{"index": MARQO_INDEX, "q": q.query, "limit": q.top_k, 'filter': q.filter}] for q in queries
+            [{"index": MARQO_INDEX, "q": q.query, "limit": q.top_k, 'filter': q.filter} for q in queries]
         )
 
         query_results: List[QueryResult] = []
