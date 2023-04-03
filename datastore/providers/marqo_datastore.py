@@ -3,6 +3,7 @@ import json
 from typing import Dict, List, Optional
 import marqo
 import warnings
+import re
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 from datastore.datastore import DataStore
@@ -27,6 +28,7 @@ assert MARQO_INDEX is not None
 # optional configuration environmental variables
 MARQO_INFERENCE_MODEL = os.environ.get('MARQO_INFERENCE_MODEL')
 MARQO_UPSERT_BATCH_SIZE = os.environ.get('MARQO_UPSERT_BATCH_SIZE')
+TREAT_URLS_AND_POINTERS_AS_IMAGES = os.environ.get('TREAT_URLS_AND_POINTERS_AS_IMAGES')
 
 # batchsize for upsert operations
 if not MARQO_UPSERT_BATCH_SIZE:
@@ -36,13 +38,18 @@ if not MARQO_UPSERT_BATCH_SIZE:
 if not MARQO_INFERENCE_MODEL:
     MARQO_INFERENCE_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
+if not TREAT_URLS_AND_POINTERS_AS_IMAGES or TREAT_URLS_AND_POINTERS_AS_IMAGES.lower() != "true":
+    TREAT_URLS_AND_POINTERS_AS_IMAGES = False
+else:
+    TREAT_URLS_AND_POINTERS_AS_IMAGES = True
+
 class MarqoDataStore(DataStore):
     def __init__(self):
 
         self.client = marqo.Client(url=MARQO_API_URL, api_key=MARQO_API_KEY)
 
         try:
-            self.client.create_index(MARQO_INDEX)
+            self.client.create_index(MARQO_INDEX, treat_urls_and_pointers_as_images=TREAT_URLS_AND_POINTERS_AS_IMAGES)
             print(f"Created index {MARQO_INDEX}")
         except marqo.errors.MarqoWebError:
             print(f"Using existing index {MARQO_INDEX}")
@@ -59,6 +66,7 @@ class MarqoDataStore(DataStore):
         # Initialize a list of documents
         documents: List[str] = []
         fields = set()
+        images = set()
         for doc_id, chunk_list in chunks.items():
             # Append the id to the ids list
             doc_ids.append(doc_id)
@@ -75,11 +83,17 @@ class MarqoDataStore(DataStore):
                 document["_id"] = doc_id
                 document["metadata"] = metadata
 
+                if TREAT_URLS_AND_POINTERS_AS_IMAGES:
+                    urls = self._extract_urls(chunk.text)
+                    for idx, url in urls:
+                        document[f"img{idx}"] = url
+                        images.add(f"img{idx}")
+
                 documents.append(document)
 
                 fields |= document.keys()
 
-        non_tensor_fields = list(fields-{"text",})
+        non_tensor_fields = list(fields-{*images, "text"})
 
         # insert all documents
         request_batch_size = 1024
@@ -105,6 +119,16 @@ class MarqoDataStore(DataStore):
         """
         Takes in a list of queries with embeddings and filters and returns a list of query results with matching document chunks and scores.
         """
+
+        # if working with images as well then extract image urls from the query and create a new query object that composes the text and images together
+        if TREAT_URLS_AND_POINTERS_AS_IMAGES:
+            for i in range(len(queries)):
+                urls = self._extract_urls(queries[i].query)
+                new_query = {}
+                new_query[queries[i].query] = 1
+                for url in urls:
+                    new_query[url] = 1
+                queries[i] = new_query
 
         results = self.client.bulk_search(
             [{"index": MARQO_INDEX, "q": q.query, "limit": q.top_k, 'filter': q.filter} for q in queries]
@@ -204,3 +228,6 @@ class MarqoDataStore(DataStore):
                 processed_metadata[field] = to_unix_timestamp(value)
 
         return json.dumps(processed_metadata)
+    
+    def _extract_urls(self, text: str) -> List[str]:
+        return re.findall('https:.*?\.(?:png|jpg|svg)', text)
