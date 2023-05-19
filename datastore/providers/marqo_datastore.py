@@ -49,12 +49,12 @@ class MarqoDataStore(DataStore):
     def __init__(self):
 
         self.client = marqo.Client(url=MARQO_API_URL, api_key=MARQO_API_KEY)
-        self.index_name = MARQO_INDEX
+
         try:
-            self.client.create_index(self.index_name, model=MARQO_INFERENCE_MODEL, treat_urls_and_pointers_as_images=TREAT_URLS_AND_POINTERS_AS_IMAGES)
-            print(f"Created index {self.index_name}")
+            self.client.create_index(MARQO_INDEX, model=MARQO_INFERENCE_MODEL, treat_urls_and_pointers_as_images=TREAT_URLS_AND_POINTERS_AS_IMAGES)
+            print(f"Created index {MARQO_INDEX}")
         except marqo.errors.MarqoWebError:
-            print(f"Using existing index {self.index_name}")
+            print(f"Using existing index {MARQO_INDEX}")
 
     async def upsert(
         self, documents: List[Document], chunk_token_size: Optional[int] = None
@@ -74,8 +74,7 @@ class MarqoDataStore(DataStore):
 
             # Add the list of chunks for this document to the dictionary with the document id as the key
             chunks[doc_id] = doc_chunks
-        print(all_chunks)
-        return await self._upsert(all_chunks)
+        return await self._upsert(chunks)
     
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
     async def _upsert(self, chunks: Dict[str, List[DocumentChunk]]) -> List[str]:
@@ -99,18 +98,20 @@ class MarqoDataStore(DataStore):
                 # Get the wrangled metadata
                 metadata = self._wrangle_metadata(chunk.metadata)
 
+                if TREAT_URLS_AND_POINTERS_AS_IMAGES:
+                    urls = self._extract_urls(chunk.text)
+                    for idx, url in enumerate(urls):
+                        document[f"img{idx}"] = url
+                        images.add(f"img{idx}")
+
+                        chunk.text = chunk.text.replace(url, " ")
+
                 # Add the text and document id to the document dict
                 document = {}
                 document["text"] = chunk.text
                 document["document_id"] = doc_id
                 document["_id"] = doc_id
                 document["metadata"] = metadata
-
-                if TREAT_URLS_AND_POINTERS_AS_IMAGES:
-                    urls = self._extract_urls(chunk.text)
-                    for idx, url in urls:
-                        document[f"img{idx}"] = url
-                        images.add(f"img{idx}")
 
                 documents.append(document)
 
@@ -121,16 +122,18 @@ class MarqoDataStore(DataStore):
         # insert all documents
         request_batch_size = 1024
         for i in range(0, len(documents), request_batch_size):
-            response = self.client.index(self.index_name).add_documents(
+            responses = self.client.index(MARQO_INDEX).add_documents(
                 documents=documents[i:i+request_batch_size],
                 non_tensor_fields=non_tensor_fields,
                 client_batch_size=MARQO_UPSERT_BATCH_SIZE,
                 server_batch_size=MARQO_UPSERT_BATCH_SIZE,
             )
-            
-            if response['errors']:
-                print(f"ERROR: Errors occured while adding documents, error occured in index range {i}-{i+request_batch_size}")
-                print(response)
+
+            for response in responses:
+                for item in response[0]['items']:
+                    if item['status'] not in {200, 201}:
+                        print(f"ERROR: Document with id {item['_id']} returned status code {item['status']}")
+                        print(item)
 
         return doc_ids
 
@@ -148,27 +151,23 @@ class MarqoDataStore(DataStore):
         """
         Takes in a list of queries with embeddings and filters and returns a list of query results with matching document chunks and scores.
         """
-
         # if working with images as well then extract image urls from the query and create a new query object that composes the text and images together
         if TREAT_URLS_AND_POINTERS_AS_IMAGES:
             for i in range(len(queries)):
                 urls = self._extract_urls(queries[i].query)
-                print(urls)
+
                 new_query = {}
-                new_query[queries[i].query] = 1
-                print(new_query)
+                
                 for url in urls:
                     new_query[url] = 1
-                print(new_query)
-                queries[i] = new_query
+                    queries[i].query = queries[i].query.replace(url, " ")
+
+                new_query[queries[i].query] = 1
+                queries[i].query = new_query
 
         results = self.client.bulk_search(
-            [{"index": self.index_name, "q": q.query, "limit": q.top_k, 'filter': q.filter} for q in queries]
+            [{"index": MARQO_INDEX, "q": q.query, "limit": q.top_k, 'filter': q.filter} for q in queries]
         )
-
-        import json 
-
-        print(json.dumps(results, indent=4))
 
         query_results: List[QueryResult] = []
    
@@ -191,8 +190,7 @@ class MarqoDataStore(DataStore):
                     score=hit.get('_score')
                 )
                 doc_chunks.append(doc_chunk)
-            query_results.append(QueryResult(query=result['query'], results=doc_chunks))
-    
+            query_results.append(QueryResult(query=str(result['query']), results=doc_chunks))
         return query_results
     
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
@@ -208,14 +206,14 @@ class MarqoDataStore(DataStore):
         if delete_all:
             try:
                 print("Deleting all documents")
-                response = self.client.delete_index(self.index_name)
+                response = self.client.delete_index(MARQO_INDEX)
                 print(response)
             except Exception as e:
                 print("Error deleting index")
                 raise e
                 
             try:
-                response = self.client.create_index(self.index_name, model=MARQO_INFERENCE_MODEL, treat_urls_and_pointers_as_images=TREAT_URLS_AND_POINTERS_AS_IMAGES)
+                response = self.client.create_index(MARQO_INDEX, model=MARQO_INFERENCE_MODEL, treat_urls_and_pointers_as_images=TREAT_URLS_AND_POINTERS_AS_IMAGES)
                 print(response)
             except Exception as e:
                 print("Error creating new index after deletion")
@@ -224,7 +222,7 @@ class MarqoDataStore(DataStore):
         if ids:
             try:
                 print(f"Deleting {len(ids)} documents by id")
-                response = self.client.index(self.index_name).delete_documents(ids)
+                response = self.client.index(MARQO_INDEX).delete_documents(ids)
                 print(response)
             except:
                 print("Error deleting documents.")
@@ -270,15 +268,15 @@ class MarqoDataStore(DataStore):
     ) -> str:
         if metadata is None:
             return {}
-
-        processed_metadata = {**metadata}
+        
+        processed_metadata = {**metadata.dict()}
 
         # For fields that are dates, convert them to unix timestamps
-        for field, value in processed_metadata.dict().items():
-            if field == "created_at":
+        for field, value in processed_metadata.items():
+            if field == "created_at" and value is not None:
                 processed_metadata[field] = to_unix_timestamp(value)
 
         return json.dumps(processed_metadata)
     
     def _extract_urls(self, text: str) -> List[str]:
-        return re.findall('https:.*?\.(?:png|jpg)', text)
+        return re.findall(r'(?:http\:|https\:)?\/\/.*\.(?:png|jpg)', text)
